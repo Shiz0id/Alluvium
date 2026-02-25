@@ -216,10 +216,4 @@ Alluvium asks: what if we kept the interface but replaced the assumption?
 
 ---
 
-## License
-
-TBD
-
----
-
-*Alluvium: the sediment that builds new ground. Varve: the layered record of what came before.*
+*Alluvium: the sediment that builds new ground. Varve: the layered sediment record of what came before.*

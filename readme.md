@@ -1,10 +1,10 @@
 # Alluvium
 
-**A FUSE prototype for Varve FS — the content-addressed, version-native filesystem.**
+**A FUSE PoC for Varvefs — the content-addressed, version-native filesystem.**
 
 Alluvium is a working proof of concept for a filesystem that treats files as immutable, content-addressed objects in a hash lake. The familiar POSIX directory tree is a computed illusion projected from the lake. Every edit creates a new version. Nothing is ever overwritten. Nothing is ever lost.
 
-This is the foundation layer for Varve FS, an operating-system-level filesystem that combines content-addressed storage, relational semantic metadata, and full version history as first-class features.
+This is the foundation layer for Varvefs, a filesystem that combines content-addressed storage, relational semantic metadata, and full version history as first-class features.
 
 ---
 
@@ -216,10 +216,4 @@ Alluvium asks: what if we kept the interface but replaced the assumption?
 
 ---
 
-## License
-
-TBD
-
----
-
-*Alluvium: the sediment that builds new ground. Varve: the layered record of what came before.*
+*Alluvium: the sediment that builds new ground. Varve: the layered sediment record of what came before.*

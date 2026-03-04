@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/lake-core",
+    "crates/lake-cabi",
+    "crates/lake-fuse",
+    "crates/lakectl",
+]
+resolver = "2"

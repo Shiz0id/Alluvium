@@ -1,0 +1,11 @@
+[package]
+name = "lake-fuse"
+version = "0.1.0"
+edition = "2021"
+description = "FUSE filesystem frontend for the DeepLake hash lake"
+
+[dependencies]
+lake-core = { path = "../lake-core" }
+fuser = "0.14"
+libc = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"] }

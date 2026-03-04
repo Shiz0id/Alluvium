@@ -1,0 +1,11 @@
+[package]
+name = "lake-cabi"
+version = "0.1.0"
+edition = "2021"
+description = "C-compatible API for lake-core"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+lake-core = { path = "../lake-core" }

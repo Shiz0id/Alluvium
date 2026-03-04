@@ -1,0 +1,10 @@
+[package]
+name = "lakectl"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for DeepLake filesystem operations"
+
+[dependencies]
+lake-core = { path = "../lake-core" }
+clap = { version = "4", features = ["derive"] }
+colored = "2"

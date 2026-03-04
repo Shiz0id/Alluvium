@@ -133,23 +133,35 @@ The CLI talks directly to the lake and path table, bypassing FUSE. Use `--lake <
 
 ```
 alluvium/
-├── Cargo.toml                  # workspace
-└── crates/
-    ├── lake-core/
-    │   └── src/
-    │       ├── lib.rs          # module exports
-    │       ├── types.rs        # B3Hash, Chunk, ChunkRef, Manifest, Version
-    │       ├── store.rs        # content-addressed object store
-    │       ├── ingest.rs       # FastCDC chunking pipeline
-    │       ├── diff.rs         # positional diff engine
-    │       ├── path_table.rs   # SQLite path → manifest mapping
-    │       └── history.rs      # version chain coordination
-    ├── lake-fuse/
-    │   └── src/
-    │       └── main.rs         # FUSE mount + .alluvium virtual namespace
-    └── lakectl/
-        └── src/
-            └── main.rs         # CLI tool
+├── Cargo.toml                          # workspace root
+├── crates/
+│   ├── lake-core/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── types.rs
+│   │       ├── store.rs
+│   │       ├── ingest.rs
+│   │       ├── diff.rs
+│   │       ├── path_table.rs
+│   │       └── history.rs
+│   ├── lake-cabi/
+│   │   ├── Cargo.toml
+│   │   ├── include/
+│   │   │   └── lake.h
+│   │   └── src/
+│   │       └── lib.rs
+│   ├── lake-fuse/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── main.rs
+│   └── lakectl/
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs
+├── winfsp/
+│   └── lakefs.c                        # not part of cargo workspace
+└── README.md
 ```
 
 ---

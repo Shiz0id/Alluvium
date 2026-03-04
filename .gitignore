@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+
+# Lake storage (test/dev lakes)
+.lake/
+
+# Mount points
+mnt/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# WinFSP build artifacts
+winfsp/*.obj
+winfsp/*.exe
+winfsp/*.pdb
+winfsp/*.ilk

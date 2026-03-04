@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::diff::{self, DiffResult};
 use crate::path_table::{PathTable, PathTableError};
 use crate::store::ObjectStore;
-use crate::types::{B3Hash, Manifest, Version, VersionTrigger};
+use crate::types::{B3Hash, Version, VersionTrigger};
 
 // ─── Error Type ──────────────────────────────────────────────────
 
@@ -199,7 +199,7 @@ mod tests {
     impl TestHarness {
         fn new() -> Self {
             let dir = tempdir().unwrap();
-            let store = ObjectStore::open(dir.into_path().join("lake")).unwrap();
+            let store = ObjectStore::open(dir.path().join("lake")).unwrap();
             let paths = PathTable::in_memory().unwrap();
             TestHarness { store, paths }
         }
@@ -308,7 +308,7 @@ mod tests {
         let h = TestHarness::new();
 
         // Large enough to chunk, with small differences between versions
-        let mut data: Vec<u8> = (0..256 * 1024)
+        let mut data: Vec<u8> = (0u64..256 * 1024)
             .map(|i| (i.wrapping_mul(31).wrapping_add(17)) as u8)
             .collect();
 

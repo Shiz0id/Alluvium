@@ -114,7 +114,7 @@ mod tests {
         let ingester = Ingester::new(&store);
 
         // 256KB of pseudo-random data to trigger multiple CDC boundaries
-        let data: Vec<u8> = (0..256 * 1024)
+        let data: Vec<u8> = (0u64..256 * 1024)
             .map(|i| (i.wrapping_mul(31).wrapping_add(17)) as u8)
             .collect();
 
@@ -148,7 +148,7 @@ mod tests {
 
         // Two large files that differ only in one region.
         // CDC should produce mostly identical chunks.
-        let mut data1: Vec<u8> = (0..256 * 1024)
+        let mut data1: Vec<u8> = (0u64..256 * 1024)
             .map(|i| (i.wrapping_mul(31).wrapping_add(17)) as u8)
             .collect();
         let mut data2 = data1.clone();

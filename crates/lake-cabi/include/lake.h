@@ -202,6 +202,24 @@ int lake_storage_stats(const LakeHandle* handle,
                        const char* path,
                        LakeStorageStats* stats_out);
 
+/* ── Ranged Read ─────────────────────────────────────────────── */
+
+/**
+ * Get total file size for a path without reading chunk data.
+ * Only reads the manifest.
+ */
+int lake_get_file_size(const LakeHandle* handle,
+                       const char* path, uint64_t* size_out);
+
+/**
+ * Read a byte range from a file. Only fetches chunks that overlap
+ * the requested range. Uses an LRU cache for sequential reads.
+ * Caller must free with lake_bytes_free().
+ */
+int lake_read_range(const LakeHandle* handle,
+                    const char* path, uint64_t offset, uint32_t size,
+                    uint8_t** data_out, size_t* len_out);
+
 /* ── Directory Listing ───────────────────────────────────────── */
 
 typedef struct {

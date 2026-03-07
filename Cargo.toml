@@ -5,4 +5,13 @@ members = [
     "crates/lake-fuse",
     "crates/lakectl",
 ]
+
+# Default build excludes lake-fuse since it requires Linux FUSE libraries.
+# Build it explicitly with: cargo build -p lake-fuse (in WSL/Linux)
+default-members = [
+    "crates/lake-core",
+    "crates/lake-cabi",
+    "crates/lakectl",
+]
+
 resolver = "2"

@@ -409,6 +409,22 @@ impl PathTable {
 
         Ok(paths)
     }
+
+    /// List all active (non-deleted) paths in the table.
+    /// Returns every path regardless of hierarchy — works for both
+    /// slash-delimited paths and flat UUID identifiers.
+    pub fn list_all(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path FROM paths WHERE deleted = 0 ORDER BY path",
+        )?;
+
+        let paths = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(paths)
+    }
 }
 
 // ─── Directory Entry ─────────────────────────────────────────────

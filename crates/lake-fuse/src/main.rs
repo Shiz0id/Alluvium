@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -14,6 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use lake_core::history::History;
 use lake_core::ingest::Ingester;
 use lake_core::path_table::PathTable;
+use lake_core::reader::{ChunkIndex, FileReader};
 use lake_core::store::ObjectStore;
 use lake_core::types::{B3Hash, VersionTrigger};
 
@@ -244,7 +245,8 @@ pub struct LakeFS {
     paths: PathTable,
     inodes: InodeStore,
     virtual_inodes: Mutex<VirtualInodes>,
-    open_files: Mutex<HashMap<u64, WriteBuffer>>,
+    reader: Mutex<FileReader<'static>>,
+    open_files: Mutex<HashMap<u64, OpenFile>>,
     next_fh: Mutex<u64>,
 }
 
@@ -929,41 +931,65 @@ impl Filesystem for LakeFS {
             return reply.error(libc::ENOENT);
         }
 
-        // Check write buffer first
-        {
-            let open = self.open_files.lock().unwrap();
-            if let Some(buf) = open.get(&fh) {
-                let start = offset as usize;
-                let end = (start + size as usize).min(buf.data.len());
-                if start >= buf.data.len() {
-                    return reply.data(&[]);
-                }
-                return reply.data(&buf.data[start..end]);
-            }
+        // Check open file handles
+        enum ReadAction {
+            FromBuffer(Vec<u8>),
+            FromIndex(ChunkIndex),
+            NoHandle,
         }
 
-        // Read from lake
-        let (path, _) = match self.inodes.get_path(ino) {
-            Ok(Some(p)) => p,
-            _ => return reply.error(libc::ENOENT),
+        let action = {
+            let open = self.open_files.lock().unwrap();
+            match open.get(&fh) {
+                Some(OpenFile::Write(buf)) => {
+                    let start = offset as usize;
+                    let end = (start + size as usize).min(buf.data.len());
+                    if start >= buf.data.len() {
+                        ReadAction::FromBuffer(Vec::new())
+                    } else {
+                        ReadAction::FromBuffer(buf.data[start..end].to_vec())
+                    }
+                }
+                Some(OpenFile::Read(handle)) => {
+                    ReadAction::FromIndex(handle.index.clone())
+                }
+                None => ReadAction::NoHandle,
+            }
         };
 
-        let head = match self.paths.get_head(&path) {
-            Ok(h) => h,
-            Err(_) => return reply.error(libc::ENOENT),
-        };
+        match action {
+            ReadAction::FromBuffer(data) => return reply.data(&data),
+            ReadAction::FromIndex(index) => {
+                let mut reader = self.reader.lock().unwrap();
+                match reader.read(&index, offset as u64, size) {
+                    Ok(data) => return reply.data(&data),
+                    Err(_) => return reply.error(libc::EIO),
+                }
+            }
+            ReadAction::NoHandle => {
+                // Fallback: no open handle, build index on the fly
+                let (path, _) = match self.inodes.get_path(ino) {
+                    Ok(Some(p)) => p,
+                    _ => return reply.error(libc::ENOENT),
+                };
 
-        let data = match self.store.read_file(&head) {
-            Ok(d) => d,
-            Err(_) => return reply.error(libc::EIO),
-        };
+                let head = match self.paths.get_head(&path) {
+                    Ok(h) => h,
+                    Err(_) => return reply.error(libc::ENOENT),
+                };
 
-        let start = offset as usize;
-        let end = (start + size as usize).min(data.len());
-        if start >= data.len() {
-            reply.data(&[]);
-        } else {
-            reply.data(&data[start..end]);
+                let manifest = match self.store.get_manifest(&head) {
+                    Ok(m) => m,
+                    Err(_) => return reply.error(libc::EIO),
+                };
+
+                let index = ChunkIndex::from_manifest(&manifest);
+                let mut reader = self.reader.lock().unwrap();
+                match reader.read(&index, offset as u64, size) {
+                    Ok(data) => reply.data(&data),
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }
         }
     }
 
@@ -984,12 +1010,13 @@ impl Filesystem for LakeFS {
             || (flags & libc::O_RDWR != 0)
             || (flags & libc::O_APPEND != 0);
 
-        if writable {
-            let (path, _) = match self.inodes.get_path(ino) {
-                Ok(Some(p)) => p,
-                _ => return reply.error(libc::ENOENT),
-            };
+        let (path, _) = match self.inodes.get_path(ino) {
+            Ok(Some(p)) => p,
+            _ => return reply.error(libc::ENOENT),
+        };
 
+        if writable {
+            // Load current content into write buffer
             let data = match self.paths.get_head(&path) {
                 Ok(head) => self.store.read_file(&head).unwrap_or_default(),
                 Err(_) => Vec::new(),
@@ -998,12 +1025,21 @@ impl Filesystem for LakeFS {
             let mut open = self.open_files.lock().unwrap();
             open.insert(
                 fh,
-                WriteBuffer {
+                OpenFile::Write(WriteBuffer {
                     path: PathBuf::from(&path),
                     data,
                     dirty: false,
-                },
+                }),
             );
+        } else {
+            // Build chunk index for efficient reads
+            if let Ok(head) = self.paths.get_head(&path) {
+                if let Ok(manifest) = self.store.get_manifest(&head) {
+                    let index = ChunkIndex::from_manifest(&manifest);
+                    let mut open = self.open_files.lock().unwrap();
+                    open.insert(fh, OpenFile::Read(ReadHandle { index }));
+                }
+            }
         }
 
         reply.opened(fh, 0);
@@ -1023,8 +1059,8 @@ impl Filesystem for LakeFS {
     ) {
         let mut open = self.open_files.lock().unwrap();
         let buf = match open.get_mut(&fh) {
-            Some(b) => b,
-            None => return reply.error(libc::EBADF),
+            Some(OpenFile::Write(b)) => b,
+            _ => return reply.error(libc::EBADF),
         };
 
         let off = offset as usize;
@@ -1048,9 +1084,9 @@ impl Filesystem for LakeFS {
         reply: fuser::ReplyEmpty,
     ) {
         let mut open = self.open_files.lock().unwrap();
-        if let Some(buf) = open.get_mut(&fh) {
+        if let Some(OpenFile::Write(buf)) = open.get_mut(&fh) {
             if buf.dirty {
-                let ingester = Ingester::new(&self.store);
+                let ingester = Ingester::new(&*self.store);
                 match ingester.ingest(&buf.data) {
                     Ok(manifest) => {
                         let _ = self.paths.put(
@@ -1119,7 +1155,7 @@ impl Filesystem for LakeFS {
             return reply.error(libc::EROFS);
         }
 
-        let ingester = Ingester::new(&self.store);
+        let ingester = Ingester::new(&*self.store);
         let manifest = match ingester.ingest(&[]) {
             Ok(m) => m,
             Err(_) => return reply.error(libc::EIO),
@@ -1142,11 +1178,11 @@ impl Filesystem for LakeFS {
         let mut open = self.open_files.lock().unwrap();
         open.insert(
             fh,
-            WriteBuffer {
+            OpenFile::Write(WriteBuffer {
                 path: PathBuf::from(&path),
                 data: Vec::new(),
                 dirty: false,
-            },
+            }),
         );
 
         match self.file_attr(ino, &path) {
@@ -1323,7 +1359,7 @@ fn main() -> io::Result<()> {
 
     std::fs::create_dir_all(&mount_point)?;
 
-    let store = ObjectStore::open(format!("{}/objects", lake_dir))?;
+    let store = Arc::new(ObjectStore::open(format!("{}/objects", lake_dir))?);
     let paths = PathTable::open(format!("{}/paths.db", lake_dir))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let inodes = InodeStore::open(format!("{}/inodes.db", lake_dir))?;

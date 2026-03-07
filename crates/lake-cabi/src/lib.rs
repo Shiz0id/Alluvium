@@ -1,21 +1,15 @@
 //! C-compatible API for lake-core.
-//!
-//! Design principles:
-//!   - All Rust objects are exposed as opaque pointers
-//!   - All strings cross the boundary as null-terminated C strings
-//!   - All byte buffers cross with a pointer + length
-//!   - Anything allocated on the Rust side has an explicit free function
-//!   - Errors are returned as integer codes (0 = success)
-//!   - The C caller never sees Rust types directly
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
+use std::sync::{Arc, Mutex};
 
 use lake_core::history::History;
 use lake_core::ingest::Ingester;
 use lake_core::path_table::PathTable;
+use lake_core::reader::{ChunkIndex, FileReader};
 use lake_core::store::ObjectStore;
 use lake_core::types::{B3Hash, VersionTrigger};
 
@@ -32,35 +26,30 @@ pub const LAKE_ERR_HASH_PARSE: i32 = -7;
 pub const LAKE_ERR_HISTORY: i32 = -8;
 
 // ─── Opaque Handle Types ─────────────────────────────────────────
-//
-// These are the Rust objects boxed on the heap and handed to C as
-// raw pointers. C never dereferences them — it passes them back
-// to us and we reconstitute the Box to operate on them.
 
-/// Wrapper that bundles store + paths + ingester so C doesn't
-/// have to manage three separate lifetimes.
 pub struct LakeHandle {
-    store: ObjectStore,
+    store: Arc<ObjectStore>,
     paths: PathTable,
+    reader: Mutex<FileReader>,
 }
 
 /// A version record in C-friendly form.
 #[repr(C)]
 pub struct LakeVersion {
-    pub manifest_hash: *mut c_char, // hex string, caller frees via lake_string_free
+    pub manifest_hash: *mut c_char,
     pub version_num: u64,
     pub timestamp: u64,
-    pub trigger: *mut c_char,       // "close", "explicit", or "micro_hash"
-    pub message: *mut c_char,       // nullable — null if no message
+    pub trigger: *mut c_char,
+    pub message: *mut c_char,
 }
 
 /// A diff operation in C-friendly form.
 #[repr(C)]
 pub struct LakeDiffOp {
-    pub op_type: i32,               // 0 = keep, 1 = delete, 2 = insert
-    pub hash: *mut c_char,          // hex string
-    pub offset_a: u64,              // meaningful for keep and delete
-    pub offset_b: u64,              // meaningful for keep and insert
+    pub op_type: i32,
+    pub hash: *mut c_char,
+    pub offset_a: u64,
+    pub offset_b: u64,
     pub size: u64,
 }
 
@@ -87,10 +76,15 @@ pub struct LakeStorageStats {
     pub total_chunk_refs: usize,
 }
 
+/// A directory entry in C-friendly form.
+#[repr(C)]
+pub struct LakeDirEntry {
+    pub name: *mut c_char,
+    pub is_dir: i32,
+}
+
 // ─── Helper Macros ───────────────────────────────────────────────
 
-/// Safely extract a &str from a *const c_char, returning an error code
-/// if the pointer is null or the string isn't valid UTF-8.
 macro_rules! cstr_to_str {
     ($ptr:expr, $err_ret:expr) => {{
         if $ptr.is_null() {
@@ -103,7 +97,6 @@ macro_rules! cstr_to_str {
     }};
 }
 
-/// Safely dereference an opaque handle pointer.
 macro_rules! handle_ref {
     ($ptr:expr, $err_ret:expr) => {{
         if $ptr.is_null() {
@@ -113,15 +106,12 @@ macro_rules! handle_ref {
     }};
 }
 
-/// Convert a Rust String to a heap-allocated C string.
-/// Caller must free with lake_string_free.
 fn to_c_string(s: &str) -> *mut c_char {
     CString::new(s)
         .map(|cs| cs.into_raw())
         .unwrap_or(ptr::null_mut())
 }
 
-/// Convert an Option<String> to a nullable C string.
 fn to_c_string_opt(s: &Option<String>) -> *mut c_char {
     match s {
         Some(ref val) => to_c_string(val),
@@ -131,12 +121,6 @@ fn to_c_string_opt(s: &Option<String>) -> *mut c_char {
 
 // ─── Lifecycle ───────────────────────────────────────────────────
 
-/// Open a lake. Creates or opens the object store and path table
-/// at the given directory. Returns an opaque handle.
-///
-/// The caller must eventually call lake_close() to free the handle.
-///
-/// Returns null on failure.
 #[no_mangle]
 pub extern "C" fn lake_open(lake_dir: *const c_char) -> *mut LakeHandle {
     let dir = match unsafe { CStr::from_ptr(lake_dir) }.to_str() {
@@ -145,7 +129,7 @@ pub extern "C" fn lake_open(lake_dir: *const c_char) -> *mut LakeHandle {
     };
 
     let store = match ObjectStore::open(format!("{}/objects", dir)) {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(_) => return ptr::null_mut(),
     };
 
@@ -154,28 +138,20 @@ pub extern "C" fn lake_open(lake_dir: *const c_char) -> *mut LakeHandle {
         Err(_) => return ptr::null_mut(),
     };
 
-    Box::into_raw(Box::new(LakeHandle { store, paths }))
+    let reader = Mutex::new(FileReader::new(store.clone(), 64));
+
+    Box::into_raw(Box::new(LakeHandle { store, paths, reader }))
 }
 
-/// Close a lake handle and free all associated resources.
 #[no_mangle]
 pub extern "C" fn lake_close(handle: *mut LakeHandle) {
     if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle));
-        }
+        unsafe { drop(Box::from_raw(handle)); }
     }
 }
 
 // ─── Ingest ──────────────────────────────────────────────────────
 
-/// Ingest raw bytes into the lake. Chunks the data, stores chunks,
-/// builds and stores a manifest.
-///
-/// On success, writes the manifest hash as a hex string into
-/// manifest_hash_out (must be at least 65 bytes: 64 hex chars + null).
-///
-/// Returns LAKE_OK on success.
 #[no_mangle]
 pub extern "C" fn lake_ingest(
     handle: *const LakeHandle,
@@ -203,12 +179,11 @@ pub extern "C" fn lake_ingest(
         Err(_) => return LAKE_ERR_STORE,
     };
 
-    // Write hex hash + null terminator into the output buffer
     let hex = manifest.hash.to_hex();
     let hex_bytes = hex.as_bytes();
     unsafe {
         ptr::copy_nonoverlapping(hex_bytes.as_ptr(), manifest_hash_out as *mut u8, 64);
-        *manifest_hash_out.add(64) = 0; // null terminator
+        *manifest_hash_out.add(64) = 0;
     }
 
     LAKE_OK
@@ -216,12 +191,6 @@ pub extern "C" fn lake_ingest(
 
 // ─── Read ────────────────────────────────────────────────────────
 
-/// Read a complete file from the lake by manifest hash.
-///
-/// On success, allocates a byte buffer and writes pointer and length
-/// to data_out and len_out. Caller must free with lake_bytes_free().
-///
-/// Returns LAKE_OK on success.
 #[no_mangle]
 pub extern "C" fn lake_read_file(
     handle: *const LakeHandle,
@@ -254,32 +223,22 @@ pub extern "C" fn lake_read_file(
     LAKE_OK
 }
 
-/// Free a byte buffer returned by lake_read_file or lake_read_version.
 #[no_mangle]
 pub extern "C" fn lake_bytes_free(data: *mut u8, len: usize) {
     if !data.is_null() {
-        unsafe {
-            drop(Box::from_raw(slice::from_raw_parts_mut(data, len)));
-        }
+        unsafe { drop(Box::from_raw(slice::from_raw_parts_mut(data, len))); }
     }
 }
 
-/// Free a C string returned by the lake API.
 #[no_mangle]
 pub extern "C" fn lake_string_free(s: *mut c_char) {
     if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
-        }
+        unsafe { drop(CString::from_raw(s)); }
     }
 }
 
 // ─── Path Table Operations ───────────────────────────────────────
 
-/// Register a file version: sets HEAD and appends a version record.
-///
-/// trigger should be one of: "close", "explicit", "micro_hash".
-/// message can be null.
 #[no_mangle]
 pub extern "C" fn lake_put(
     handle: *const LakeHandle,
@@ -320,9 +279,6 @@ pub extern "C" fn lake_put(
     }
 }
 
-/// Get the HEAD manifest hash for a path.
-///
-/// hash_out must be at least 65 bytes.
 #[no_mangle]
 pub extern "C" fn lake_get_head(
     handle: *const LakeHandle,
@@ -337,12 +293,8 @@ pub extern "C" fn lake_get_head(
 
     let hash = match h.paths.get_head(path_str) {
         Ok(h) => h,
-        Err(lake_core::path_table::PathTableError::NotFound(_)) => {
-            return LAKE_ERR_NOT_FOUND
-        }
-        Err(lake_core::path_table::PathTableError::Deleted(_)) => {
-            return LAKE_ERR_DELETED
-        }
+        Err(lake_core::path_table::PathTableError::NotFound(_)) => return LAKE_ERR_NOT_FOUND,
+        Err(lake_core::path_table::PathTableError::Deleted(_)) => return LAKE_ERR_DELETED,
         Err(_) => return LAKE_ERR_PATH_TABLE,
     };
 
@@ -355,7 +307,6 @@ pub extern "C" fn lake_get_head(
     LAKE_OK
 }
 
-/// Soft-delete a file.
 #[no_mangle]
 pub extern "C" fn lake_delete(
     handle: *const LakeHandle,
@@ -363,14 +314,12 @@ pub extern "C" fn lake_delete(
 ) -> i32 {
     let h = handle_ref!(handle, LAKE_ERR_NULL_PTR);
     let path_str = cstr_to_str!(path, LAKE_ERR_NULL_PTR);
-
     match h.paths.delete(path_str) {
         Ok(()) => LAKE_OK,
         Err(_) => LAKE_ERR_NOT_FOUND,
     }
 }
 
-/// Restore a soft-deleted file.
 #[no_mangle]
 pub extern "C" fn lake_restore(
     handle: *const LakeHandle,
@@ -378,14 +327,12 @@ pub extern "C" fn lake_restore(
 ) -> i32 {
     let h = handle_ref!(handle, LAKE_ERR_NULL_PTR);
     let path_str = cstr_to_str!(path, LAKE_ERR_NULL_PTR);
-
     match h.paths.restore(path_str) {
         Ok(()) => LAKE_OK,
         Err(_) => LAKE_ERR_NOT_FOUND,
     }
 }
 
-/// Rename a file. Metadata-only operation.
 #[no_mangle]
 pub extern "C" fn lake_rename(
     handle: *const LakeHandle,
@@ -395,7 +342,6 @@ pub extern "C" fn lake_rename(
     let h = handle_ref!(handle, LAKE_ERR_NULL_PTR);
     let old = cstr_to_str!(old_path, LAKE_ERR_NULL_PTR);
     let new = cstr_to_str!(new_path, LAKE_ERR_NULL_PTR);
-
     match h.paths.rename(old, new) {
         Ok(()) => LAKE_OK,
         Err(_) => LAKE_ERR_NOT_FOUND,
@@ -404,11 +350,6 @@ pub extern "C" fn lake_rename(
 
 // ─── History Operations ──────────────────────────────────────────
 
-/// Get the version history for a file.
-///
-/// On success, allocates an array of LakeVersion and writes pointer
-/// and count to versions_out and count_out.
-/// Caller must free with lake_versions_free().
 #[no_mangle]
 pub extern "C" fn lake_history_list(
     handle: *const LakeHandle,
@@ -448,7 +389,7 @@ pub extern "C" fn lake_history_list(
         .collect();
 
     let ptr = c_versions.as_mut_ptr();
-    std::mem::forget(c_versions); // ownership transfers to C
+    std::mem::forget(c_versions);
 
     unsafe {
         *versions_out = ptr;
@@ -458,12 +399,9 @@ pub extern "C" fn lake_history_list(
     LAKE_OK
 }
 
-/// Free a version array returned by lake_history_list.
 #[no_mangle]
 pub extern "C" fn lake_versions_free(versions: *mut LakeVersion, count: usize) {
-    if versions.is_null() {
-        return;
-    }
+    if versions.is_null() { return; }
     unsafe {
         let slice = slice::from_raw_parts_mut(versions, count);
         for v in slice.iter_mut() {
@@ -473,14 +411,10 @@ pub extern "C" fn lake_versions_free(versions: *mut LakeVersion, count: usize) {
                 lake_string_free(v.message);
             }
         }
-        // Reconstruct and drop the Vec
         drop(Vec::from_raw_parts(versions, count, count));
     }
 }
 
-/// Read file content at a specific version number.
-///
-/// Caller must free data with lake_bytes_free().
 #[no_mangle]
 pub extern "C" fn lake_read_version(
     handle: *const LakeHandle,
@@ -513,7 +447,6 @@ pub extern "C" fn lake_read_version(
     LAKE_OK
 }
 
-/// Rewind a file to a previous version number. Non-destructive.
 #[no_mangle]
 pub extern "C" fn lake_rewind(
     handle: *const LakeHandle,
@@ -532,9 +465,6 @@ pub extern "C" fn lake_rewind(
 
 // ─── Diff ────────────────────────────────────────────────────────
 
-/// Diff two versions of a file by version number.
-///
-/// Caller must free the result with lake_diff_free().
 #[no_mangle]
 pub extern "C" fn lake_diff(
     handle: *const LakeHandle,
@@ -609,12 +539,9 @@ pub extern "C" fn lake_diff(
     LAKE_OK
 }
 
-/// Free a diff result returned by lake_diff.
 #[no_mangle]
 pub extern "C" fn lake_diff_free(result: *mut LakeDiffResult) {
-    if result.is_null() {
-        return;
-    }
+    if result.is_null() { return; }
     unsafe {
         let r = &*result;
         if !r.ops.is_null() {
@@ -627,20 +554,89 @@ pub extern "C" fn lake_diff_free(result: *mut LakeDiffResult) {
     }
 }
 
-// ─── Directory Listing ───────────────────────────────────────────
+// ─── Ranged Read ─────────────────────────────────────────────────
 
-/// A directory entry in C-friendly form.
-#[repr(C)]
-pub struct LakeDirEntry {
-    pub name: *mut c_char,
-    pub is_dir: i32, // 0 = file, 1 = directory
+/// Get the total file size for a path without reading any chunk data.
+#[no_mangle]
+pub extern "C" fn lake_get_file_size(
+    handle: *const LakeHandle,
+    path: *const c_char,
+    size_out: *mut u64,
+) -> i32 {
+    let h = handle_ref!(handle, LAKE_ERR_NULL_PTR);
+    let path_str = cstr_to_str!(path, LAKE_ERR_NULL_PTR);
+    if size_out.is_null() {
+        return LAKE_ERR_NULL_PTR;
+    }
+
+    let hash = match h.paths.get_head(path_str) {
+        Ok(h) => h,
+        Err(lake_core::path_table::PathTableError::NotFound(_)) => return LAKE_ERR_NOT_FOUND,
+        Err(lake_core::path_table::PathTableError::Deleted(_)) => return LAKE_ERR_DELETED,
+        Err(_) => return LAKE_ERR_PATH_TABLE,
+    };
+
+    let manifest = match h.store.get_manifest(&hash) {
+        Ok(m) => m,
+        Err(_) => return LAKE_ERR_STORE,
+    };
+
+    unsafe { *size_out = manifest.total_size; }
+    LAKE_OK
 }
 
-/// List immediate children of a directory.
-///
-/// On success, allocates an array of LakeDirEntry and writes pointer
-/// and count to entries_out and count_out.
-/// Caller must free with lake_dir_entries_free().
+/// Read a byte range from a file. Only fetches the chunks that overlap
+/// the requested range. Uses an LRU cache for sequential read patterns.
+#[no_mangle]
+pub extern "C" fn lake_read_range(
+    handle: *const LakeHandle,
+    path: *const c_char,
+    offset: u64,
+    size: u32,
+    data_out: *mut *mut u8,
+    len_out: *mut usize,
+) -> i32 {
+    let h = handle_ref!(handle, LAKE_ERR_NULL_PTR);
+    let path_str = cstr_to_str!(path, LAKE_ERR_NULL_PTR);
+    if data_out.is_null() || len_out.is_null() {
+        return LAKE_ERR_NULL_PTR;
+    }
+
+    let hash = match h.paths.get_head(path_str) {
+        Ok(h) => h,
+        Err(_) => return LAKE_ERR_NOT_FOUND,
+    };
+
+    let manifest = match h.store.get_manifest(&hash) {
+        Ok(m) => m,
+        Err(_) => return LAKE_ERR_STORE,
+    };
+
+    let index = ChunkIndex::from_manifest(&manifest);
+    let mut reader = match h.reader.lock() {
+        Ok(r) => r,
+        Err(_) => return LAKE_ERR_STORE,
+    };
+
+    let data: Vec<u8> = match reader.read(&index, offset, size) {
+        Ok(d) => d,
+        Err(_) => return LAKE_ERR_STORE,
+    };
+
+    let len = data.len();
+    let buf = data.into_boxed_slice();
+    let ptr = Box::into_raw(buf) as *mut u8;
+
+    unsafe {
+        *data_out = ptr;
+        *len_out = len;
+    }
+
+    LAKE_OK
+}
+
+// ─── Directory Listing ───────────────────────────────────────────
+
 #[no_mangle]
 pub extern "C" fn lake_list_dir(
     handle: *const LakeHandle,
@@ -679,12 +675,9 @@ pub extern "C" fn lake_list_dir(
     LAKE_OK
 }
 
-/// Free a directory entry array returned by lake_list_dir.
 #[no_mangle]
 pub extern "C" fn lake_dir_entries_free(entries: *mut LakeDirEntry, count: usize) {
-    if entries.is_null() {
-        return;
-    }
+    if entries.is_null() { return; }
     unsafe {
         let slice = slice::from_raw_parts_mut(entries, count);
         for e in slice.iter_mut() {
@@ -694,12 +687,6 @@ pub extern "C" fn lake_dir_entries_free(entries: *mut LakeDirEntry, count: usize
     }
 }
 
-/// List soft-deleted file paths.
-///
-/// On success, allocates an array of C strings and writes pointer
-/// and count to paths_out and count_out.
-/// Caller must free each string with lake_string_free(), then
-/// free the array itself with lake_string_array_free().
 #[no_mangle]
 pub extern "C" fn lake_list_deleted(
     handle: *const LakeHandle,
@@ -733,12 +720,9 @@ pub extern "C" fn lake_list_deleted(
     LAKE_OK
 }
 
-/// Free a string array returned by lake_list_deleted.
 #[no_mangle]
 pub extern "C" fn lake_string_array_free(arr: *mut *mut c_char, count: usize) {
-    if arr.is_null() {
-        return;
-    }
+    if arr.is_null() { return; }
     unsafe {
         let slice = slice::from_raw_parts_mut(arr, count);
         for s in slice.iter_mut() {
@@ -750,7 +734,6 @@ pub extern "C" fn lake_string_array_free(arr: *mut *mut c_char, count: usize) {
 
 // ─── Storage Stats ───────────────────────────────────────────────
 
-/// Get storage statistics for a file's version history.
 #[no_mangle]
 pub extern "C" fn lake_storage_stats(
     handle: *const LakeHandle,
